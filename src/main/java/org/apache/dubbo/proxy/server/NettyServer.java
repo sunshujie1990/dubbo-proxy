@@ -1,10 +1,5 @@
 package org.apache.dubbo.proxy.server;
 
-import org.apache.dubbo.proxy.dao.ServiceMapping;
-import org.apache.dubbo.proxy.metadata.MetadataCollector;
-import org.apache.dubbo.proxy.service.GenericInvoke;
-import org.apache.dubbo.proxy.utils.InetAddressUtil;
-import org.apache.dubbo.proxy.utils.NamingThreadFactory;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
@@ -17,11 +12,12 @@ import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
-import org.apache.dubbo.registry.Registry;
+import org.apache.dubbo.proxy.config.ConfigCenter;
+import org.apache.dubbo.proxy.service.AsyncGenericInvoker;
+import org.apache.dubbo.proxy.utils.NamingThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
@@ -40,36 +36,26 @@ public class NettyServer {
             .newSingleThreadExecutor(new NamingThreadFactory(
                     "Dubbo-proxy-starter"));
 
-    @Value("${netty.port}")
-    private int port;
-
-    @Value("${business.thread.count}")
-    private int businessThreadCount;
+    private final ConfigCenter configCenter;
+    private final AsyncGenericInvoker asyncGenericInvoker;
 
     @Autowired
-    private MetadataCollector metadataCollector;
-
-    @Autowired
-    private ServiceMapping serviceMapping;
-
-    @Autowired
-    private Registry registry;
-
-
+    public NettyServer(ConfigCenter configCenter, AsyncGenericInvoker asyncGenericInvoker) {
+        this.configCenter = configCenter;
+        this.asyncGenericInvoker = asyncGenericInvoker;
+    }
 
 
     @PostConstruct
     public void start() {
         serverStartor.execute(() -> {
             init();
-            String inetHost = InetAddressUtil.getLocalIP();
             try {
-                ChannelFuture f = bootstrap.bind(inetHost, port).sync();
-                logger.info("Dubbo proxy started, host is {} , port is {}.",
-                        inetHost, port);
+                ChannelFuture f = bootstrap.bind(configCenter.getProxyConfig().getBind(),
+                        configCenter.getProxyConfig().getPort()).sync();
+                logger.info("Dubbo proxy started, {}", configCenter.getProxyConfig());
                 f.channel().closeFuture().sync();
-                logger.info("Dubbo proxy closed, host is {} , port is {}.",
-                        inetHost, port);
+                logger.info("Dubbo proxy closed, {}", configCenter.getProxyConfig());
             } catch (InterruptedException e) {
                 logger.error("dubbo proxy start failed", e);
             } finally {
@@ -80,19 +66,19 @@ public class NettyServer {
     }
 
     private void init() {
-        GenericInvoke.setRegistry(this.registry);
         bootstrap = new ServerBootstrap();
-        bossGroup = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors(), new NamingThreadFactory("" +
-                "Dubbo-Proxy-Boss"));
+        // reactor模型一个acceptor线程就够了
+        bossGroup = new NioEventLoopGroup(1, new NamingThreadFactory("Dubbo-Proxy-Boss"));
+        // 纯异步调用 worker线程池无需太大
         workerGroup = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2,
-                new NamingThreadFactory("Dubbo-Proxy-Work"));
-        HttpProcessHandler processHandler = new HttpProcessHandler(businessThreadCount, serviceMapping, metadataCollector);
+                new NamingThreadFactory("Dubbo-Proxy-Worker"));
+        HttpProcessHandler processHandler = new HttpProcessHandler(configCenter, asyncGenericInvoker);
         bootstrap.group(bossGroup, workerGroup)
                 .channel(NioServerSocketChannel.class)
+                .option(ChannelOption.SO_BACKLOG, 256)
                 .childHandler(new ProxyChannelInitializer(processHandler))
                 .childOption(ChannelOption.TCP_NODELAY, true)
                 .childOption(ChannelOption.SO_KEEPALIVE, true);
-
     }
 
     @PreDestroy
@@ -113,16 +99,14 @@ public class NettyServer {
 
         public ProxyChannelInitializer(HttpProcessHandler httpProcessHandler) {
             this.httpProcessHandler = httpProcessHandler;
-
         }
 
         @Override
         protected void initChannel(SocketChannel ch) throws Exception {
-
             ch.pipeline().addLast(
                     new LoggingHandler(NettyServer.class, LogLevel.DEBUG),
-                    new HttpServerCodec(), new HttpObjectAggregator(512*1024*1024),
-                     httpProcessHandler);
+                    new HttpServerCodec(), new HttpObjectAggregator(512 * 1024 * 1024),
+                    httpProcessHandler);
         }
     }
 }
